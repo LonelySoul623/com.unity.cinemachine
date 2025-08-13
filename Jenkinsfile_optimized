@@ -1,0 +1,240 @@
+pipeline {
+    agent any
+    
+    options {
+        // 构建超时设置
+        timeout(time: 30, unit: 'MINUTES')
+        // 保留构建历史
+        buildDiscarder(logRotator(numToKeepStr: '10'))
+        // 跳过默认checkout
+        skipDefaultCheckout()
+    }
+    
+    parameters {
+        string(name: 'this_branch', defaultValue: 'main', description: '构建分支')
+        string(name: 'AUTO_job_projectVersion', defaultValue: '1.0.0', description: '版本号')
+        booleanParam(name: 'CLEAN_BUILD', defaultValue: false, description: '强制清理构建')
+        booleanParam(name: 'SKIP_TESTS', defaultValue: false, description: '跳过测试')
+    }
+    
+    environment {
+        WORKSPACE_PATH = 'D:\\jenkins\\workspace\\workspace\\bpc_xr_innovation13340'
+        UNITY_PATH = 'D:\\Unity Hub\\Editor\\2021.2.8f1c1\\Editor\\Unity.exe'
+        PROJECT_PATH = "${WORKSPACE_PATH}\\pj_xr_holographic"
+        CACHE_DIR = "${WORKSPACE_PATH}\\.build_cache"
+        
+        // Unity性能优化环境变量
+        UNITY_DISABLE_GRAPHICS = '1'
+        UNITY_BATCH_MODE = '1'
+    }
+    
+    stages {
+        stage('环境准备') {
+            parallel {
+                stage('代码同步') {
+                    steps {
+                        script {
+                            echo "开始代码同步: ${params.this_branch}"
+                            
+                            // 使用Jenkins的Git插件进行优化的代码拉取
+                            checkout([
+                                $class: 'GitSCM',
+                                branches: [[name: "*/${params.this_branch}"]],
+                                doGenerateSubmoduleConfigurations: false,
+                                extensions: [
+                                    [$class: 'CloneOption', depth: 1, shallow: true],
+                                    [$class: 'CheckoutOption', timeout: 10]
+                                ],
+                                submoduleCfg: [],
+                                userRemoteConfigs: [[url: env.GIT_URL]]
+                            ])
+                        }
+                    }
+                }
+                
+                stage('缓存初始化') {
+                    steps {
+                        script {
+                            echo "初始化构建缓存目录"
+                            bat """
+                                if not exist "${env.CACHE_DIR}" mkdir "${env.CACHE_DIR}"
+                                if not exist "${env.CACHE_DIR}\\Library" mkdir "${env.CACHE_DIR}\\Library"
+                                if not exist "${env.CACHE_DIR}\\Packages" mkdir "${env.CACHE_DIR}\\Packages"
+                            """
+                        }
+                    }
+                }
+            }
+        }
+        
+        stage('缓存恢复') {
+            when {
+                not { params.CLEAN_BUILD }
+            }
+            steps {
+                script {
+                    echo "恢复构建缓存"
+                    bat """
+                        if exist "${env.CACHE_DIR}\\Library\\metadata" (
+                            echo "恢复Library缓存..."
+                            xcopy "${env.CACHE_DIR}\\Library\\*" "${env.PROJECT_PATH}\\Library\\" /E /I /Y /Q
+                        )
+                        
+                        if exist "${env.CACHE_DIR}\\Packages\\manifest.json" (
+                            echo "恢复Packages缓存..."
+                            xcopy "${env.CACHE_DIR}\\Packages\\*" "${env.PROJECT_PATH}\\Packages\\" /E /I /Y /Q
+                        )
+                    """
+                }
+            }
+        }
+        
+        stage('Unity构建') {
+            steps {
+                script {
+                    echo "开始Unity构建"
+                    
+                    def processed_branch = params.this_branch.replace('/', '_')
+                    def result_dir = "${env.WORKSPACE_PATH}\\origin\\${processed_branch}_${params.AUTO_job_projectVersion}"
+                    
+                    bat """
+                        if not exist "${env.WORKSPACE_PATH}\\origin" mkdir "${env.WORKSPACE_PATH}\\origin"
+                        if not exist "${result_dir}" mkdir "${result_dir}"
+                        
+                        "${env.UNITY_PATH}" ^
+                          -batchmode ^
+                          -quit ^
+                          -nographics ^
+                          -silent-crashes ^
+                          -disable-assembly-updater ^
+                          -accept-apiupdate ^
+                          -buildTarget Win64 ^
+                          -projectPath "${env.PROJECT_PATH}" ^
+                          -executeMethod BuilldPlayerTools.BuildPlayer ^
+                          -productName=Holo ^
+                          -version=${params.AUTO_job_projectVersion} ^
+                          -prefixDir="${result_dir}" ^
+                          -logFile "${env.WORKSPACE_PATH}\\unity_build.log"
+                    """
+                    
+                    // 验证构建结果
+                    bat """
+                        if not exist "${result_dir}\\Holo.exe" (
+                            echo "构建失败：未找到输出文件"
+                            type "${env.WORKSPACE_PATH}\\unity_build.log"
+                            exit /b 1
+                        )
+                        echo "构建成功：${result_dir}\\Holo.exe"
+                    """
+                }
+            }
+            post {
+                always {
+                    // 保存构建日志
+                    archiveArtifacts artifacts: 'unity_build.log', allowEmptyArchive: true
+                }
+            }
+        }
+        
+        stage('缓存保存') {
+            steps {
+                script {
+                    echo "保存构建缓存"
+                    bat """
+                        if exist "${env.PROJECT_PATH}\\Library\\metadata" (
+                            echo "保存Library缓存..."
+                            xcopy "${env.PROJECT_PATH}\\Library\\*" "${env.CACHE_DIR}\\Library\\" /E /I /Y /Q
+                        )
+                        
+                        if exist "${env.PROJECT_PATH}\\Packages\\manifest.json" (
+                            echo "保存Packages缓存..."
+                            xcopy "${env.PROJECT_PATH}\\Packages\\*" "${env.CACHE_DIR}\\Packages\\" /E /I /Y /Q
+                        )
+                    """
+                }
+            }
+        }
+        
+        stage('测试') {
+            when {
+                not { params.SKIP_TESTS }
+            }
+            parallel {
+                stage('单元测试') {
+                    steps {
+                        script {
+                            echo "执行Unity单元测试"
+                            // 这里可以添加Unity Test Runner的命令
+                        }
+                    }
+                }
+                
+                stage('构建验证') {
+                    steps {
+                        script {
+                            echo "验证构建产物"
+                            def processed_branch = params.this_branch.replace('/', '_')
+                            def result_dir = "${env.WORKSPACE_PATH}\\origin\\${processed_branch}_${params.AUTO_job_projectVersion}"
+                            
+                            bat """
+                                if exist "${result_dir}\\Holo.exe" (
+                                    echo "验证成功：构建产物存在"
+                                    dir "${result_dir}"
+                                ) else (
+                                    echo "验证失败：构建产物不存在"
+                                    exit /b 1
+                                )
+                            """
+                        }
+                    }
+                }
+            }
+        }
+        
+        stage('打包') {
+            steps {
+                script {
+                    echo "打包构建产物"
+                    def processed_branch = params.this_branch.replace('/', '_')
+                    def result_dir = "${env.WORKSPACE_PATH}\\origin\\${processed_branch}_${params.AUTO_job_projectVersion}"
+                    def zip_path = "${result_dir}.zip"
+                    
+                    // 使用PowerShell进行压缩（比Windows原生zip更快）
+                    bat """
+                        powershell -Command "Compress-Archive -Path '${result_dir}\\*' -DestinationPath '${zip_path}' -Force"
+                        echo "打包完成：${zip_path}"
+                    """
+                    
+                    // 归档构建产物
+                    archiveArtifacts artifacts: "origin/${processed_branch}_${params.AUTO_job_projectVersion}.zip", 
+                                   fingerprint: true
+                }
+            }
+        }
+    }
+    
+    post {
+        always {
+            script {
+                def duration = currentBuild.duration
+                echo "构建总时间：${duration}ms (${duration/1000}秒)"
+            }
+        }
+        
+        success {
+            echo "🎉 构建成功完成！"
+        }
+        
+        failure {
+            echo "❌ 构建失败，请检查日志"
+            // 发送通知给开发团队
+        }
+        
+        cleanup {
+            // 清理临时文件
+            bat """
+                if exist temp_remote_info.txt del temp_remote_info.txt
+            """
+        }
+    }
+}
